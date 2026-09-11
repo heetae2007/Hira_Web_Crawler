@@ -4,9 +4,10 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable
+from types import SimpleNamespace
 
 import feedparser
 import requests
@@ -20,14 +21,13 @@ LOG_PATH = BASE_DIR / os.getenv("LOG_PATH", "hira_alert.log")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SEND_EXISTING_ON_FIRST_RUN = os.getenv(
-    "SEND_EXISTING_ON_FIRST_RUN", "false"
-).lower() in {"1", "true", "yes", "y"}
+NOTIFY_FROM_DATE = date(2026, 9, 9)
+KST = timezone(timedelta(hours=9))
 
 # 쉼표로 구분. 비워두면 모든 새 글 알림.
 INCLUDE_KEYWORDS = [
     x.strip().lower()
-    for x in os.getenv("INCLUDE_KEYWORDS", "고시").split(",")
+    for x in os.getenv("INCLUDE_KEYWORDS", "").split(",")
     if x.strip()
 ]
 EXCLUDE_KEYWORDS = [
@@ -76,9 +76,24 @@ def connect_db() -> sqlite3.Connection:
     return conn
 
 
-def is_first_run(conn: sqlite3.Connection) -> bool:
-    row = conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()
-    return row[0] == 0
+def publication_date(value: str) -> date:
+    """HIRA의 시간대 없는 게시일은 한국 시간으로 해석한다."""
+    value = value.strip()
+    for fmt in ("%Y%m%d %H:%M:%S", "%Y%m%d", "%Y.%m.%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"게시일을 해석할 수 없습니다: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=KST)
+    return parsed.astimezone(KST).date()
 
 
 def make_item_key(feed_name: str, entry) -> str:
@@ -172,9 +187,14 @@ def mark_seen(
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn.execute(
         """
-        INSERT OR IGNORE INTO seen_items
+        INSERT INTO seen_items
         (item_key, feed_name, title, link, published, first_seen_at, notified_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_key) DO UPDATE SET
+            title = excluded.title,
+            link = excluded.link,
+            published = excluded.published,
+            notified_at = COALESCE(seen_items.notified_at, excluded.notified_at)
         """,
         (
             item_key,
@@ -191,24 +211,33 @@ def mark_seen(
 
 def run() -> int:
     conn = connect_db()
-    first_run = is_first_run(conn)
+    log.info("실행 시작: 알림 시작일=%s (한국 시간), DB=%s", NOTIFY_FROM_DATE, DB_PATH)
 
     total_new = 0
     sent = 0
     errors = 0
 
+    # RSS에서 빠졌어도 기존 DB의 미발송 항목은 재평가한다.
+    pending = conn.execute(
+        "SELECT item_key, feed_name, title, link, published FROM seen_items WHERE notified_at IS NULL"
+    ).fetchall()
+
     for feed_name, url in RSS_FEEDS.items():
+        candidates = {
+            row[0]: SimpleNamespace(title=row[2], link=row[3], published=row[4] or "")
+            for row in pending if row[1] == feed_name
+        }
         try:
             feed = fetch_feed(url)
+            for entry in reversed(feed.entries):
+                candidates[make_item_key(feed_name, entry)] = entry
+            log.info("[%s] RSS 항목=%d", feed_name, len(feed.entries))
         except Exception as e:
             errors += 1
             log.exception("[%s] RSS 조회 실패: %s", feed_name, e)
-            continue
 
-        # 오래된 글부터 처리해서 여러 건 발생 시 시간 순서로 알림
-        entries: Iterable = reversed(feed.entries)
-
-        for entry in entries:
+        # 기존 미발송 항목과 현재 RSS 항목을 함께 처리한다.
+        for key, entry in candidates.items():
             title = getattr(entry, "title", "").strip()
             link = getattr(entry, "link", "").strip()
             summary = getattr(entry, "summary", "") or ""
@@ -217,24 +246,29 @@ def run() -> int:
                 or getattr(entry, "updated", "")
                 or ""
             ).strip()
-            key = make_item_key(feed_name, entry)
 
             exists = conn.execute(
-                "SELECT 1 FROM seen_items WHERE item_key = ?", (key,)
+                "SELECT notified_at FROM seen_items WHERE item_key = ?", (key,)
             ).fetchone()
-            if exists:
+            if exists and exists[0]:
                 continue
 
-            total_new += 1
+            total_new += int(exists is None)
             should_notify = matches_keywords(title, summary)
 
-            # 첫 실행 기본값: 현재 RSS에 있는 기존 글은 기준점으로 저장만 함.
-            # 이후 새로 올라온 글부터 알림.
-            if first_run and not SEND_EXISTING_ON_FIRST_RUN:
+            try:
+                posted_on = publication_date(published)
+            except ValueError as e:
+                errors += 1
+                log.error("[%s] 게시일 확인 필요, 발송 보류: %s (%s)", feed_name, title, e)
+                continue
+
+            if posted_on < NOTIFY_FROM_DATE:
                 mark_seen(
                     conn, key, feed_name, title, link, published, notified=False
                 )
-                log.info("[%s] 초기 기준점 저장: %s", feed_name, title)
+                if not exists:
+                    log.info("[%s] 시작일 이전, 기준점 저장: %s", feed_name, title)
                 continue
 
             if not should_notify:
