@@ -13,6 +13,8 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
+from biz_hira import run_biz
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -23,6 +25,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 NOTIFY_FROM_DATE = date(2026, 9, 9)
 KST = timezone(timedelta(hours=9))
+BIZ_BBS_IDS = list(dict.fromkeys(
+    value.strip() for value in os.getenv("BIZ_BBS_IDS", "BBSMSTR_000000000675").split(",")
+    if value.strip()
+))
+BIZ_MAX_PAGES = int(os.getenv("BIZ_MAX_PAGES", "200"))
 
 # 쉼표로 구분. 비워두면 모든 새 글 알림.
 INCLUDE_KEYWORDS = [
@@ -79,6 +86,8 @@ def connect_db() -> sqlite3.Connection:
 def publication_date(value: str) -> date:
     """HIRA의 시간대 없는 게시일은 한국 시간으로 해석한다."""
     value = value.strip()
+    if len(value) == 17 and value.isdigit():
+        return datetime.strptime(value, "%Y%m%d%H%M%S%f").date()
     for fmt in ("%Y%m%d %H:%M:%S", "%Y%m%d", "%Y.%m.%d", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(value, fmt).date()
@@ -290,6 +299,19 @@ def run() -> int:
                 errors += 1
                 log.exception("[%s] Telegram 전송 실패: %s", feed_name, e)
 
+    if BIZ_BBS_IDS:
+        try:
+            biz_new, biz_sent, biz_errors = run_biz(
+                conn, BIZ_BBS_IDS, notify_from_date=NOTIFY_FROM_DATE,
+                publication_date=publication_date, matches_keywords=matches_keywords,
+                send_telegram=send_telegram, max_pages=BIZ_MAX_PAGES,
+            )
+            total_new += biz_new
+            sent += biz_sent
+            errors += biz_errors
+        except Exception:
+            errors += 1
+            log.exception("biz 수집 실행 실패")
     conn.close()
     log.info("완료: 신규=%d, 발송=%d, 오류=%d", total_new, sent, errors)
     return 1 if errors else 0

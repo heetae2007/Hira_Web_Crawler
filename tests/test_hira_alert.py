@@ -26,6 +26,7 @@ class AlertTests(unittest.TestCase):
         for name, value in {
             "DB_PATH": Path(self.tmp.name) / "test.db",
             "RSS_FEEDS": {"test": "https://example.invalid/feed"},
+            "BIZ_BBS_IDS": [],
             "INCLUDE_KEYWORDS": [], "EXCLUDE_KEYWORDS": [],
         }.items():
             p = patch.object(self.app, name, value)
@@ -47,6 +48,7 @@ class AlertTests(unittest.TestCase):
             ("2026-09-08T15:00:00Z", "2026-09-09"),
             ("Tue, 08 Sep 2026 14:59:59 GMT", "2026-09-08"),
             ("2026-09-09", "2026-09-09"),
+            ("20260915102852000", "2026-09-15"),
         ]:
             self.assertEqual(self.app.publication_date(raw).isoformat(), expected)
         for raw in ("", "invalid", "20261399 00:00:00"):
@@ -90,6 +92,30 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertEqual(self.run_feed([self.entry("unknown", "20260909")], sent.append), 0)
         self.assertEqual(len(sent), 1)
+
+    def test_biz_failure_does_not_prevent_rss_notification(self):
+        sent = []
+        with patch.object(self.app, "BIZ_BBS_IDS", ["board"]), \
+             patch.object(self.app, "run_biz", side_effect=RuntimeError("simulated biz failure")):
+            self.assertEqual(self.run_feed([self.entry("rss", "20260909")], sent.append), 1)
+        self.assertEqual(len(sent), 1)
+
+    def test_biz_table_added_to_existing_rss_database(self):
+        import biz_hira
+
+        sent = []
+        entry = self.entry("rss", "20260909")
+        self.assertEqual(self.run_feed([entry], sent.append), 0)
+        with patch.object(self.app, "BIZ_BBS_IDS", ["board"]), \
+             patch.object(biz_hira, "crawl_biz_hira", return_value=iter([])):
+            self.assertEqual(self.run_feed([entry], sent.append), 0)
+        self.assertEqual(len(sent), 1)
+        conn = self.app.connect_db()
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM biz_posts").fetchone()[0], 0)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
