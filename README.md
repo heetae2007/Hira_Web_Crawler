@@ -1,6 +1,44 @@
 # HIRA 심평원 고시 Telegram 알리미
 
-건강보험심사평가원(HIRA)의 공식 RSS와 biz.hira 공개 게시판을 주기적으로 확인해 Telegram으로 알려줍니다. RSS는 키워드에 맞는 새 게시물, biz는 고시번호가 확인된 신규·수정 게시물을 알립니다.
+건강보험심사평가원(HIRA)의 공식 RSS와 요양기관 업무포털 메인 공지사항을 주기적으로 확인해 Telegram으로 알려줍니다. 메인 공지사항은 비로그인 Playwright Chromium으로 조회합니다. 기존 직접 POST 게시판 수집은 선택 기능입니다.
+
+## 업무포털 메인 공지사항 (기본 활성화)
+
+```dotenv
+BIZ_MODE=main
+BIZ_MAIN_MIN_INTERVAL=300
+```
+
+- 매 실행 시 새 비로그인 브라우저로 `https://biz.hira.or.kr/index.do`에 접속합니다. 로그인·인증서·저장된 브라우저 프로필을 사용하지 않습니다.
+- 페이지 로딩 전에 응답 대기를 등록하고, 브라우저가 보내는 `/qya/main/selectTotalZoneList.ndo` POST의 200 응답에서 `dsBoard`를 읽습니다. Playwright [네트워크 응답 대기 API](https://playwright.dev/python/docs/network)를 사용합니다.
+- 실제 비로그인 브라우저 응답에서 `bbsId`, `itemId`, `title`, `regDate`를 확인했습니다. 등록일은 `20260921100846000` 형태를 `2026-09-21`로 변환합니다. 2026-09-22 개발 환경에서 새 점검 명령으로 공지 8건을 조회했고, ID `75929`의 설명회 안내(등록일 `2026-09-21`)를 확인했습니다. Ubuntu 운영 환경의 조회·Telegram 전송은 별도 확인이 필요합니다.
+- 신규 여부는 게시판 ID+게시글 ID로 판단합니다. 게시글 ID가 비어 있으면 게시판 ID+제목+등록일을 사용합니다. ID가 있는 글의 제목 수정은 신규 알림이 아닙니다.
+- 기존 SQLite에 `biz_main_notices`, `biz_main_poll` 테이블을 추가합니다. 최신 목록 표시와 전체 확인 이력을 함께 유지하여 목록에서 사라졌다 다시 나타난 글은 재발송하지 않습니다.
+- **첫 실행에는 현재 메인 목록의 모든 공지를 알립니다.** 메인 공지사항에는 고시번호·키워드·기존 9월 9일 날짜 필터를 적용하지 않습니다. RSS의 기존 필터는 유지됩니다.
+- 알림 성공 후에만 발송 완료를 저장합니다. 실패한 알림은 목록에서 사라져도 다음 주기에 재시도합니다. 전송 직후 저장 전에 프로세스가 종료되면 중복 전송될 수 있습니다.
+- 응답 실패, 필수 컬럼/날짜 오류, 빈 목록은 오류로 기록하고 직전 목록을 보존합니다. 해당 실행에서 브라우저를 다시 열지 않고 다음 주기에 재시도합니다.
+- 기본 조회 간격은 300초이며 최소 60초로 제한합니다. 실패한 조회도 간격에 포함됩니다. 간격은 DB에 저장되므로 cron 재실행에도 유지됩니다. 페이지 자체가 로딩하는 리소스 요청은 브라우저가 처리합니다.
+- `run.sh`는 Linux의 `flock`으로 중복 실행을 막습니다. 기본 운용은 기존 5분 cron에서 1회씩 실행하는 방식입니다.
+- 메인 화면에 표시된 항목만 감시하므로 주기 사이에 목록 밖으로 밀려난 공지는 확인할 수 없습니다.
+- `BIZ_MODE=legacy`는 기존 직접 POST 고시 수집, `both`는 두 방식 모두, `off`는 RSS만 실행합니다. `both`에서는 같은 게시물에 출처별 알림이 갈 수 있습니다. 기존 `.env`에 `BIZ_BBS_IDS`만 있어도 기본 모드는 `main`입니다.
+
+### 기존 Ubuntu 설치 업데이트
+
+수정된 소스와 `requirements.txt`를 서버에 반영한 뒤 실행합니다. 기존 DB는 유지하세요.
+
+```bash
+cd /home/ubuntu/Hira_Web_Crawler
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install --with-deps chromium
+# DB 저장 및 Telegram 발송 없는 실제 메인 목록 점검
+.venv/bin/python biz_hira.py
+# 기존 RSS + 메인 공지사항 확인 및 Telegram 발송
+./run.sh
+```
+
+`--with-deps`는 Ubuntu 브라우저 실행에 필요한 시스템 패키지도 설치하며 sudo 권한이 필요할 수 있습니다. cron과 같은 OS 사용자로 브라우저를 설치하세요. Windows 설치는 `.venv\Scripts\python -m playwright install chromium`을 사용합니다.
+
+테스트: `python -m unittest discover -s tests` (Playwright와 Chromium 설치 필요). 브라우저 테스트는 네트워크 응답을 로컬에서 대체하여 사이트 요청·Telegram 발송 없이 검증합니다.
 
 ## 기본 감시 RSS
 
@@ -46,6 +84,7 @@ Windows PowerShell:
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python -m playwright install chromium
 Copy-Item .env.example .env
 ```
 
@@ -58,7 +97,7 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 
-첫 실행 여부와 관계없이 한국 시간 기준 게시일로 처리합니다.
+RSS 및 선택 기능인 기존 고시 수집은 첫 실행 여부와 관계없이 한국 시간 기준 게시일로 처리합니다. 메인 공지사항은 위 정책을 따릅니다.
 
 - 2026년 9월 8일까지: DB에 기준점으로 저장만 합니다.
 - 2026년 9월 9일부터: 미발송 게시물을 알립니다.
@@ -75,16 +114,17 @@ EXCLUDE_KEYWORDS=
 `SEND_EXISTING_ON_FIRST_RUN`은 더 이상 사용하지 않습니다. 다음 cron 실행에서 9월 9일 이후 미발송 글이 여러 건 전송될 수 있습니다.
 RSS 수집 범위는 현재 RSS 항목과 기존 DB입니다. RSS에도 DB에도 없는 게시물은 알릴 수 없습니다. biz 수집 범위는 아래와 같습니다.
 
-## biz.hira 고시 수집
+## biz.hira 기존 고시 수집 (BIZ_MODE=legacy 또는 both)
 
 기본 게시판 ID는 `BBSMSTR_000000000675`입니다. 추가 게시판은 쉼표로 구분합니다.
 
 ```dotenv
 BIZ_BBS_IDS=BBSMSTR_000000000675
 BIZ_MAX_PAGES=200
+BIZ_MODE=legacy
 ```
 
-- `BIZ_BBS_IDS=`로 비우면 기존 RSS만 수집합니다. 기존 `.env`에 설정이 없으면 위 게시판이 기본 활성화됩니다.
+- `BIZ_BBS_IDS=`로 비우면 기존 직접 POST 게시판 수집을 생략합니다. 메인 수집 활성화 여부는 `BIZ_MODE`로 결정합니다.
 - `selectComBbsList.ndo`에 UTF-8 SSV `dsParam`을 POST하고 `dsMain`을 파싱합니다. 브라우저 쿠키·분석 식별자·로그인 정보를 넣지 않습니다.
 - 연결 10초 / 응답 30초 timeout입니다. 연결·응답 시간 초과와 HTTP 429/500/502/503/504는 최대 3회 요청하며 1초, 2초 간격으로 재시도합니다. 파싱 오류와 리다이렉트는 실패로 기록합니다.
 - 일반 게시글이 없는 페이지까지 순회합니다. 이미 저장된 ID가 있는 페이지도 계속 읽으므로 뒤쪽 신규·수정 게시글을 확인합니다. 고정 공지는 ID로 중복 제거하고 종료 판단에서 제외합니다.

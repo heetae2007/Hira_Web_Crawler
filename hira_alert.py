@@ -13,7 +13,7 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
-from biz_hira import run_biz
+from biz_hira import run_biz, run_main_notices
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -30,6 +30,8 @@ BIZ_BBS_IDS = list(dict.fromkeys(
     if value.strip()
 ))
 BIZ_MAX_PAGES = int(os.getenv("BIZ_MAX_PAGES", "200"))
+BIZ_MODE = os.getenv("BIZ_MODE", "main").strip().lower()
+BIZ_MAIN_MIN_INTERVAL = max(60, int(os.getenv("BIZ_MAIN_MIN_INTERVAL", "300")))
 
 # 쉼표로 구분. 비워두면 모든 새 글 알림.
 INCLUDE_KEYWORDS = [
@@ -219,6 +221,9 @@ def mark_seen(
 
 
 def run() -> int:
+    if BIZ_MODE not in {"main", "legacy", "both", "off"}:
+        log.error("BIZ_MODE는 main, legacy, both, off 중 하나여야 합니다")
+        return 1
     conn = connect_db()
     log.info("실행 시작: 알림 시작일=%s (한국 시간), DB=%s", NOTIFY_FROM_DATE, DB_PATH)
 
@@ -299,7 +304,19 @@ def run() -> int:
                 errors += 1
                 log.exception("[%s] Telegram 전송 실패: %s", feed_name, e)
 
-    if BIZ_BBS_IDS:
+    if BIZ_MODE in {"main", "both"}:
+        try:
+            main_new, main_sent, main_errors = run_main_notices(
+                conn, send_notification=send_telegram, min_interval=BIZ_MAIN_MIN_INTERVAL,
+            )
+            total_new += main_new
+            sent += main_sent
+            errors += main_errors
+        except Exception:
+            errors += 1
+            log.exception("메인 공지사항 실행 실패")
+
+    if BIZ_MODE in {"legacy", "both"} and BIZ_BBS_IDS:
         try:
             biz_new, biz_sent, biz_errors = run_biz(
                 conn, BIZ_BBS_IDS, notify_from_date=NOTIFY_FROM_DATE,

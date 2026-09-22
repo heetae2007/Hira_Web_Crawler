@@ -9,12 +9,15 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 import requests
 
 RS, US, ETX = "\x1e", "\x1f", "\x03"
 ENDPOINT = "https://biz.hira.or.kr/qya/bbs/selectComBbsList.ndo"
 PORTAL_URL = "https://biz.hira.or.kr/"
+MAIN_URL = PORTAL_URL + "index.do"
+MAIN_LIST_PATH = "/qya/main/selectTotalZoneList.ndo"
 SOURCE = "biz.hira"
 log = logging.getLogger("hira-alert")
 
@@ -314,18 +317,162 @@ def run_biz(conn, boards, *, notify_from_date, publication_date, matches_keyword
     return counts["NEW"], sent, errors
 
 
+@dataclass(frozen=True)
+class MainNotice:
+    bbs_id: str
+    item_id: str
+    title: str
+    registered_at: str
+
+    @property
+    def key(self):
+        identity = (["id", self.bbs_id, self.item_id] if self.item_id else
+                    ["title-date", self.bbs_id, self.title, self.registered_at])
+        return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+
+
+def parse_main_notices(text: str) -> list[MainNotice]:
+    """Use the dsBoard schema observed in the public homepage response."""
+    notices = {}
+    for row in parse_ssv_dataset(text, "dsBoard"):
+        if not {"title", "regDate", "bbsId"} <= row.keys():
+            raise SSVError("메인 공지사항 필수 컬럼 누락: title/regDate/bbsId")
+        title = html.unescape(row["title"]).strip()
+        bbs_id = row["bbsId"].strip()
+        raw_date = row["regDate"].strip()
+        if not title or not bbs_id:
+            raise SSVError("메인 공지사항 제목 또는 게시판 ID 누락")
+        try:
+            if re.fullmatch(r"\d{17}", raw_date):
+                registered_at = datetime.strptime(raw_date, "%Y%m%d%H%M%S%f").date()
+            else:
+                registered_at = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise SSVError(f"메인 공지사항 등록일 오류: {raw_date!r}") from exc
+        notice = MainNotice(bbs_id, row.get("itemId", "").strip(), title, registered_at.isoformat())
+        if notice.key in notices and notices[notice.key] != notice:
+            raise SSVError("같은 공지사항 ID에 서로 다른 데이터가 있습니다")
+        notices[notice.key] = notice
+    # An empty/changed response must not silently replace a working baseline.
+    if not notices:
+        raise SSVError("메인 공지사항 dsBoard가 비어 있습니다. 상태를 보존합니다")
+    return list(notices.values())
+
+
+def read_main_response(page, *, timeout_ms=60000):
+    """Listen before navigation, including requests from Nexacro frames."""
+    def matches(response):
+        url = urlsplit(response.url)
+        return (url.scheme == "https" and url.hostname == "biz.hira.or.kr"
+                and url.path == MAIN_LIST_PATH and response.request.method == "POST")
+
+    page.set_default_timeout(timeout_ms)
+    with page.expect_response(matches, timeout=timeout_ms) as pending:
+        page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+    response = pending.value
+    if response.status != 200:
+        raise SSVError(f"메인 공지사항 HTTP {response.status}")
+    return parse_main_notices(response.text())
+
+
+def fetch_main_notices(*, timeout_ms=60000):
+    """Fresh anonymous browser; no login, certificate or persistent profile."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(locale="ko-KR")
+            return read_main_response(context.new_page(), timeout_ms=timeout_ms)
+        finally:
+            browser.close()
+
+
+def run_main_notices(conn, *, send_notification, min_interval=300,
+                     fetch=None, now=None):
+    """Check once; retain history and a durable notification outbox.
+
+    First successful check notifies all visible items. No gosi/date/keyword filter.
+    Delivery is at least once: a crash after sending but before commit may duplicate.
+    """
+    fetch = fetch or fetch_main_notices
+    now = time.time() if now is None else now
+    min_interval = max(60, min_interval)
+    conn.execute("""CREATE TABLE IF NOT EXISTS biz_main_poll (
+        id INTEGER PRIMARY KEY CHECK (id=1), last_attempt REAL NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS biz_main_notices (
+        item_key TEXT PRIMARY KEY, bbs_id TEXT NOT NULL, item_id TEXT NOT NULL,
+        title TEXT NOT NULL, registered_at TEXT NOT NULL,
+        in_latest INTEGER NOT NULL DEFAULT 1, notified_at TEXT)""")
+    conn.commit()
+    # Persist the cooldown even on collection failure. BEGIN IMMEDIATE serializes
+    # competing cron processes while reserving the next request window.
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute("SELECT last_attempt FROM biz_main_poll WHERE id=1").fetchone()
+        if previous and now - previous[0] < min_interval:
+            log.info("[biz:main] 최소 조회 간격 %s초: 이번 실행 생략", min_interval)
+            return 0, 0, 0
+        conn.execute("INSERT INTO biz_main_poll VALUES (1, ?) ON CONFLICT(id) "
+                     "DO UPDATE SET last_attempt=excluded.last_attempt", (now,))
+    new = sent = errors = 0
+    try:
+        notices = fetch()
+        if not notices:
+            raise SSVError("메인 공지사항이 비어 있습니다")
+        with conn:
+            conn.execute("UPDATE biz_main_notices SET in_latest=0")
+            for notice in notices:
+                exists = conn.execute("SELECT 1 FROM biz_main_notices WHERE item_key=?",
+                                      (notice.key,)).fetchone()
+                new += int(exists is None)
+                conn.execute("""INSERT INTO biz_main_notices
+                    (item_key, bbs_id, item_id, title, registered_at, in_latest)
+                    VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(item_key) DO UPDATE SET
+                    title=excluded.title, registered_at=excluded.registered_at,
+                    in_latest=1""", (notice.key, notice.bbs_id, notice.item_id,
+                                     notice.title, notice.registered_at))
+    except Exception:
+        errors += 1
+        log.exception("[biz:main] 목록 수집 실패, 다음 주기에 재시도")
+    # Retry unsent items even if collection fails or items leave the main grid.
+    pending = conn.execute("""SELECT item_key, title, registered_at, item_id
+        FROM biz_main_notices WHERE notified_at IS NULL ORDER BY registered_at, item_key""").fetchall()
+    for key, title, registered_at, item_id in pending:
+        try:
+            send_notification("\n".join([
+                "📢 심평원 업무포털 신규 공지사항", title[:1500],
+                f"등록일: {registered_at}", f"게시글 ID: {item_id or '없음 (제목+등록일 기준)'}",
+                MAIN_URL,
+            ]))
+            with conn:
+                conn.execute("UPDATE biz_main_notices SET notified_at=? WHERE item_key=?",
+                             (datetime.now().astimezone().isoformat(timespec="seconds"), key))
+            sent += 1
+        except Exception:
+            errors += 1
+            log.exception("[biz:main] 알림 실패, 다음 주기에 재시도: %s", key)
+    log.info("[biz:main] 신규=%d, 발송=%d, 오류=%d", new, sent, errors)
+    return new, sent, errors
+
+
 def main():
     """Check one public page without opening the DB or sending notifications."""
     import argparse
 
     parser = argparse.ArgumentParser(description="biz.hira 공개 목록 조회 점검 (DB/Telegram 사용 안 함)")
-    parser.add_argument("--bbs-id", default="BBSMSTR_000000000675")
+    parser.add_argument("--bbs-id", help="기존 직접 POST 방식의 게시판 점검 (생략하면 메인 공지사항)")
     parser.add_argument("--page", type=int, default=1)
     args = parser.parse_args()
     try:
+        if not args.bbs_id:
+            posts = fetch_main_notices()
+            print(json.dumps({"count": len(posts), "notices": [asdict(p) for p in posts]},
+                             ensure_ascii=True))
+            return 0
         rows = fetch_biz_page(args.bbs_id, args.page)
         posts = [BizPost.from_row(row, args.bbs_id) for row in rows]
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
         print(f"biz check failed: {exc}")
         return 1
     print(json.dumps({"bbs_id": args.bbs_id, "page": args.page, "count": len(posts),

@@ -18,6 +18,9 @@ class AlertTests(unittest.TestCase):
     def tearDownClass(cls):
         import logging
         logging.shutdown()
+        for handler in list(logging.getLogger().handlers):
+            if getattr(handler, 'baseFilename', '') == str(Path(cls.logs.name) / 'test.log'):
+                logging.getLogger().removeHandler(handler)
         cls.logs.cleanup()
 
     def setUp(self):
@@ -27,6 +30,7 @@ class AlertTests(unittest.TestCase):
             "DB_PATH": Path(self.tmp.name) / "test.db",
             "RSS_FEEDS": {"test": "https://example.invalid/feed"},
             "BIZ_BBS_IDS": [],
+            "BIZ_MODE": "legacy",
             "INCLUDE_KEYWORDS": [], "EXCLUDE_KEYWORDS": [],
         }.items():
             p = patch.object(self.app, name, value)
@@ -99,6 +103,15 @@ class AlertTests(unittest.TestCase):
              patch.object(self.app, "run_biz", side_effect=RuntimeError("simulated biz failure")):
             self.assertEqual(self.run_feed([self.entry("rss", "20260909")], sent.append), 1)
         self.assertEqual(len(sent), 1)
+
+    def test_main_mode_uses_existing_sender_without_legacy_crawl(self):
+        sent = []
+        with patch.object(self.app, 'BIZ_MODE', 'main'), \
+             patch.object(self.app, 'run_main_notices', return_value=(2, 2, 0)) as main, \
+             patch.object(self.app, 'run_biz') as legacy:
+            self.assertEqual(self.run_feed([], sent.append), 0)
+        self.assertEqual(main.call_args.kwargs['send_notification'], sent.append)
+        legacy.assert_not_called()
 
     def test_biz_table_added_to_existing_rss_database(self):
         import biz_hira
