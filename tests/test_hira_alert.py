@@ -31,6 +31,7 @@ class AlertTests(unittest.TestCase):
             "RSS_FEEDS": {"test": "https://example.invalid/feed"},
             "BIZ_BBS_IDS": [],
             "BIZ_MODE": "legacy",
+            "EFORM_ENABLED": False,
             "INCLUDE_KEYWORDS": [], "EXCLUDE_KEYWORDS": [],
         }.items():
             p = patch.object(self.app, name, value)
@@ -112,6 +113,20 @@ class AlertTests(unittest.TestCase):
             self.assertEqual(self.run_feed([], sent.append), 0)
         self.assertEqual(main.call_args.kwargs['send_notification'], sent.append)
         legacy.assert_not_called()
+
+    def test_eform_enabled_uses_existing_sender(self):
+        sent = []
+        with patch.object(self.app, 'EFORM_ENABLED', True), \
+             patch.object(self.app, 'run_eform', return_value=(1, 1, 0)) as eform:
+            self.assertEqual(self.run_feed([], sent.append), 0)
+        self.assertEqual(eform.call_args.kwargs['send_notification'], sent.append)
+
+    def test_eform_failure_preserves_rss_delivery(self):
+        sent = []
+        with patch.object(self.app, 'EFORM_ENABLED', True), \
+             patch.object(self.app, 'run_eform', side_effect=RuntimeError('eform failed')):
+            self.assertEqual(self.run_feed([self.entry('rss', '20260909')], sent.append), 1)
+        self.assertEqual(len(sent), 1)
 
     def test_biz_table_added_to_existing_rss_database(self):
         import biz_hira

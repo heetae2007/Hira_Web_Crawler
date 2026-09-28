@@ -390,17 +390,26 @@ def fetch_main_notices(*, timeout_ms=60000):
 
 def run_main_notices(conn, *, send_notification, min_interval=300,
                      fetch=None, now=None):
+    return run_notice_source(conn, source="biz:main", send_notification=send_notification,
+                             min_interval=min_interval, fetch=fetch or fetch_main_notices, now=now)
+
+
+def run_notice_source(conn, *, source, send_notification, fetch, min_interval=300, now=None):
     """Check once; retain history and a durable notification outbox.
 
     First successful check notifies all visible items. No gosi/date/keyword filter.
     Delivery is at least once: a crash after sending but before commit may duplicate.
     """
-    fetch = fetch or fetch_main_notices
+    # SQL identifiers come exclusively from this fixed map, never configuration.
+    prefix, label, portal_url = {
+        "biz:main": ("biz_main", "심평원 업무포털", MAIN_URL),
+        "eform": ("eform", "심평원 e-Form", "https://ef.hira.or.kr/efweb/index.do"),
+    }[source]
     now = time.time() if now is None else now
     min_interval = max(60, min_interval)
-    conn.execute("""CREATE TABLE IF NOT EXISTS biz_main_poll (
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS {prefix}_poll (
         id INTEGER PRIMARY KEY CHECK (id=1), last_attempt REAL NOT NULL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS biz_main_notices (
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS {prefix}_notices (
         item_key TEXT PRIMARY KEY, bbs_id TEXT NOT NULL, item_id TEXT NOT NULL,
         title TEXT NOT NULL, registered_at TEXT NOT NULL,
         in_latest INTEGER NOT NULL DEFAULT 1, notified_at TEXT)""")
@@ -409,24 +418,24 @@ def run_main_notices(conn, *, send_notification, min_interval=300,
     # competing cron processes while reserving the next request window.
     with conn:
         conn.execute("BEGIN IMMEDIATE")
-        previous = conn.execute("SELECT last_attempt FROM biz_main_poll WHERE id=1").fetchone()
+        previous = conn.execute(f"SELECT last_attempt FROM {prefix}_poll WHERE id=1").fetchone()
         if previous and now - previous[0] < min_interval:
-            log.info("[biz:main] 최소 조회 간격 %s초: 이번 실행 생략", min_interval)
+            log.info("[%s] 최소 조회 간격 %s초: 이번 실행 생략", source, min_interval)
             return 0, 0, 0
-        conn.execute("INSERT INTO biz_main_poll VALUES (1, ?) ON CONFLICT(id) "
+        conn.execute(f"INSERT INTO {prefix}_poll VALUES (1, ?) ON CONFLICT(id) "
                      "DO UPDATE SET last_attempt=excluded.last_attempt", (now,))
     new = sent = errors = 0
     try:
         notices = fetch()
         if not notices:
-            raise SSVError("메인 공지사항이 비어 있습니다")
+            raise SSVError(f"{source} 공지사항이 비어 있습니다")
         with conn:
-            conn.execute("UPDATE biz_main_notices SET in_latest=0")
+            conn.execute(f"UPDATE {prefix}_notices SET in_latest=0")
             for notice in notices:
-                exists = conn.execute("SELECT 1 FROM biz_main_notices WHERE item_key=?",
+                exists = conn.execute(f"SELECT 1 FROM {prefix}_notices WHERE item_key=?",
                                       (notice.key,)).fetchone()
                 new += int(exists is None)
-                conn.execute("""INSERT INTO biz_main_notices
+                conn.execute(f"""INSERT INTO {prefix}_notices
                     (item_key, bbs_id, item_id, title, registered_at, in_latest)
                     VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(item_key) DO UPDATE SET
                     title=excluded.title, registered_at=excluded.registered_at,
@@ -434,25 +443,25 @@ def run_main_notices(conn, *, send_notification, min_interval=300,
                                      notice.title, notice.registered_at))
     except Exception:
         errors += 1
-        log.exception("[biz:main] 목록 수집 실패, 다음 주기에 재시도")
+        log.exception("[%s] 목록 수집 실패, 다음 주기에 재시도", source)
     # Retry unsent items even if collection fails or items leave the main grid.
-    pending = conn.execute("""SELECT item_key, title, registered_at, item_id
-        FROM biz_main_notices WHERE notified_at IS NULL ORDER BY registered_at, item_key""").fetchall()
+    pending = conn.execute(f"""SELECT item_key, title, registered_at, item_id
+        FROM {prefix}_notices WHERE notified_at IS NULL ORDER BY registered_at, item_key""").fetchall()
     for key, title, registered_at, item_id in pending:
         try:
             send_notification("\n".join([
-                "📢 심평원 업무포털 신규 공지사항", title[:1500],
+                f"📢 {label} 신규 공지사항", title[:1500],
                 f"등록일: {registered_at}", f"게시글 ID: {item_id or '없음 (제목+등록일 기준)'}",
-                MAIN_URL,
+                portal_url,
             ]))
             with conn:
-                conn.execute("UPDATE biz_main_notices SET notified_at=? WHERE item_key=?",
+                conn.execute(f"UPDATE {prefix}_notices SET notified_at=? WHERE item_key=?",
                              (datetime.now().astimezone().isoformat(timespec="seconds"), key))
             sent += 1
         except Exception:
             errors += 1
-            log.exception("[biz:main] 알림 실패, 다음 주기에 재시도: %s", key)
-    log.info("[biz:main] 신규=%d, 발송=%d, 오류=%d", new, sent, errors)
+            log.exception("[%s] 알림 실패, 다음 주기에 재시도: %s", source, key)
+    log.info("[%s] 신규=%d, 발송=%d, 오류=%d", source, new, sent, errors)
     return new, sent, errors
 
 

@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from biz_hira import run_biz, run_main_notices
+from eform_hira import run_eform
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -32,6 +33,9 @@ BIZ_BBS_IDS = list(dict.fromkeys(
 BIZ_MAX_PAGES = int(os.getenv("BIZ_MAX_PAGES", "200"))
 BIZ_MODE = os.getenv("BIZ_MODE", "main").strip().lower()
 BIZ_MAIN_MIN_INTERVAL = max(60, int(os.getenv("BIZ_MAIN_MIN_INTERVAL", "300")))
+EFORM_ENABLED = os.getenv("EFORM_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
+EFORM_MIN_INTERVAL = max(60, int(os.getenv("EFORM_MIN_INTERVAL", "300")))
+EFORM_PAGES = int(os.getenv("EFORM_PAGES", "1"))
 
 # 쉼표로 구분. 비워두면 모든 새 글 알림.
 INCLUDE_KEYWORDS = [
@@ -329,6 +333,18 @@ def run() -> int:
         except Exception:
             errors += 1
             log.exception("biz 수집 실행 실패")
+    if EFORM_ENABLED:
+        try:
+            eform_new, eform_sent, eform_errors = run_eform(
+                conn, send_notification=send_telegram,
+                min_interval=EFORM_MIN_INTERVAL, pages=EFORM_PAGES,
+            )
+            total_new += eform_new
+            sent += eform_sent
+            errors += eform_errors
+        except Exception:
+            errors += 1
+            log.exception("e-form 공지사항 실행 실패")
     conn.close()
     log.info("완료: 신규=%d, 발송=%d, 오류=%d", total_new, sent, errors)
     return 1 if errors else 0

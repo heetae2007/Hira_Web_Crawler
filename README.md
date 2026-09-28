@@ -1,6 +1,39 @@
 # HIRA 심평원 고시 Telegram 알리미
 
-건강보험심사평가원(HIRA)의 공식 RSS와 요양기관 업무포털 메인 공지사항을 주기적으로 확인해 Telegram으로 알려줍니다. 메인 공지사항은 비로그인 Playwright Chromium으로 조회합니다. 기존 직접 POST 게시판 수집은 선택 기능입니다.
+건강보험심사평가원(HIRA)의 공식 RSS, 요양기관 업무포털 메인 공지사항, e-Form 공지사항을 주기적으로 확인해 Telegram으로 알려줍니다. 두 포털은 비로그인 Playwright Chromium으로 조회합니다. 기존 직접 POST 게시판 수집은 선택 기능입니다.
+
+## e-Form 공지사항 (기본 활성화)
+
+```dotenv
+EFORM_ENABLED=1
+EFORM_MIN_INTERVAL=300
+EFORM_PAGES=1
+```
+
+- 새 비로그인 브라우저로 `https://ef.hira.or.kr/efweb/index.do`에 접속한 뒤, 동일 브라우저 컨텍스트의 쿠키를 공유하는 API 클라이언트로 `POST /efweb/ia/iac/selectBoardList.ndo`를 호출합니다. 로그인·인증서·쿠키 하드코딩은 사용하지 않습니다.
+- 제공된 `dsCond` 컬럼 순서, `boardTpCd=W`, `fetchRow=20`, NULL(`0x03`)과 빈 문자열 구분을 보존하여 SSV 바이트를 만듭니다. `Content-Type: text/xml`, `X-Requested-With: XMLHttpRequest`, `Accept: application/xml, text/xml, */*`를 사용합니다.
+- 응답 `dsList`의 `brdId`, 전체 제목 `brdTtl`, 작성일 `creDt`를 사용합니다. 작성일은 날짜로 표시하며 `chgDt` 수정일과 구분합니다. 응답의 `brdTpCd=01`(일반)은 요청의 `boardTpCd=W`와 다른 코드입니다.
+- 기본 범위는 **목록 첫 페이지 20건**입니다. `EFORM_PAGES=2`이면 첫 40건까지 조회하며 1~10페이지 설정이 가능합니다. 전체 게시판 수집을 보장하지 않으며 감시 범위 밖의 항목은 놓칠 수 있습니다. 게시판의 정렬 순서를 그대로 따릅니다.
+- **첫 실행에는 조회 범위의 기존 공지를 모두 알립니다.** 이후 처음 확인한 `brdId`만 알립니다. 제목·첨부·내용 수정은 재알림하지 않으며 키워드·고시번호·날짜 제한은 적용하지 않습니다. 다른 출처에 같은 공지가 있으면 각각 알릴 수 있습니다.
+- 제목·작성일·게시글 ID·e-Form 진입 주소를 Telegram으로 보냅니다. 상세 본문과 첨부파일은 다운로드하지 않습니다.
+- 기존 DB에 `eform_notices`, `eform_poll` 테이블을 추가합니다. biz의 기존 DB 테이블과 발송 상태는 유지합니다. 알림 완료는 전송 성공 후 기록하며, 실패 항목은 목록에서 사라져도 재시도합니다. 전송 직후 저장 전에 종료되면 중복 전송될 수 있습니다.
+- 기본 조회 간격은 300초(최소 60초)이며 API 요청 간에는 2초 대기합니다. 수집 오류 시 같은 실행에서 반복 요청하지 않습니다. 빈 목록, 형식 변경, 반복 페이지, 조회 도중 건수 변경은 실패로 기록하고 직전 목록을 보존합니다.
+- 2026-09-22 개발 환경에서 공지사항 화면의 실제 SSV 응답을 확보했고, 새 수집기로 1페이지 20건 및 2페이지 40건 조회에 성공했습니다. 본문에 쿠키 문자열을 재삽입하지 않아도 정상 조회되었습니다. Ubuntu 운영 환경과 실제 Telegram 발송은 별도 확인이 필요합니다.
+- 기존 `run.sh`와 5분 cron을 그대로 사용합니다. `BIZ_MODE`와 독립적으로 실행하며 `EFORM_ENABLED=0`으로 끌 수 있습니다.
+
+Ubuntu에 **`eform_hira.py`, `biz_hira.py`, `hira_alert.py`를 함께 업데이트**하세요. 로컬 변경을 Git으로 배포한다면 commit/push 이후 서버에서 반영해야 합니다. 기존 Playwright/Chromium 설치를 그대로 사용합니다.
+
+```bash
+cd /home/ubuntu/Hira_Web_Crawler
+# DB 저장과 Telegram 발송 없이 e-form만 점검
+.venv/bin/python eform_hira.py
+# 필요하면 2페이지까지 점검
+.venv/bin/python eform_hira.py --pages 2
+# RSS, 업무포털, e-form 수집 및 알림
+sh run.sh
+```
+
+테스트의 `tests/fixtures/eform_list.ssv`는 비로그인 공지 목록에서 확보한 실제 공개 응답입니다. 요청 쿠키나 인증정보는 포함하지 않습니다.
 
 ## 업무포털 메인 공지사항 (기본 활성화)
 
@@ -20,7 +53,7 @@ BIZ_MAIN_MIN_INTERVAL=300
 - 기본 조회 간격은 300초이며 최소 60초로 제한합니다. 실패한 조회도 간격에 포함됩니다. 간격은 DB에 저장되므로 cron 재실행에도 유지됩니다. 페이지 자체가 로딩하는 리소스 요청은 브라우저가 처리합니다.
 - `run.sh`는 Linux의 `flock`으로 중복 실행을 막습니다. 기본 운용은 기존 5분 cron에서 1회씩 실행하는 방식입니다.
 - 메인 화면에 표시된 항목만 감시하므로 주기 사이에 목록 밖으로 밀려난 공지는 확인할 수 없습니다.
-- `BIZ_MODE=legacy`는 기존 직접 POST 고시 수집, `both`는 두 방식 모두, `off`는 RSS만 실행합니다. `both`에서는 같은 게시물에 출처별 알림이 갈 수 있습니다. 기존 `.env`에 `BIZ_BBS_IDS`만 있어도 기본 모드는 `main`입니다.
+- `BIZ_MODE=legacy`는 기존 직접 POST 고시 수집, `both`는 두 방식 모두, `off`는 biz 수집을 끕니다. e-form은 `EFORM_ENABLED`로 따로 제어합니다. `both`에서는 같은 게시물에 출처별 알림이 갈 수 있습니다. 기존 `.env`에 `BIZ_BBS_IDS`만 있어도 기본 모드는 `main`입니다.
 
 ### 기존 Ubuntu 설치 업데이트
 
