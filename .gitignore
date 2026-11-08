@@ -1,0 +1,14 @@
+# 실행할 때 생기는 파일
+hira_alert.db
+hira_alert.log
+*.db
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# 비밀값
+.env
