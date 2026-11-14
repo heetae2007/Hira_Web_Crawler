@@ -1,14 +1,13 @@
-"""Anonymous HIRA e-Form notice listing via its observed Nexacro SSV API."""
+"""e-Form 공지사항 (비로그인 Playwright 세션 + Nexacro SSV API)."""
 
-import argparse
-import json
 import time
-from dataclasses import asdict
 from datetime import datetime
 
-from biz_hira import ETX, RS, US, MainNotice, SSVError, parse_ssv_dataset, run_notice_source
+from ..ssv import ETX, RS, US, SSVError, parse_ssv_dataset
+from .notice_board import MainNotice, NoticeSource, run_notice_source
 
 PORTAL_URL = "https://ef.hira.or.kr/efweb/index.do"
+SOURCE = NoticeSource("eform", "eform", "심평원 e-Form", PORTAL_URL)
 ENDPOINT = "https://ef.hira.or.kr/efweb/ia/iac/selectBoardList.ndo"
 HEADERS = {
     "Content-Type": "text/xml",
@@ -102,24 +101,6 @@ def fetch_notices(*, pages=1, timeout_ms=60000):
 
 
 def run_eform(conn, *, send_notification, min_interval=300, pages=1, fetch=None, now=None):
-    return run_notice_source(conn, source="eform", send_notification=send_notification,
+    return run_notice_source(conn, source=SOURCE, send_notification=send_notification,
                              min_interval=min_interval, now=now,
                              fetch=fetch or (lambda: fetch_notices(pages=pages)))
-
-
-def main():
-    parser = argparse.ArgumentParser(description="e-form 공개 공지 목록 점검 (DB/Telegram 사용 안 함)")
-    parser.add_argument("--pages", type=int, default=1, choices=range(1, 11))
-    args = parser.parse_args()
-    try:
-        notices = fetch_notices(pages=args.pages)
-        print(json.dumps({"count": len(notices), "notices": [asdict(n) for n in notices]},
-                         ensure_ascii=True))
-    except Exception as exc:
-        print(f"e-form check failed: {exc}")
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

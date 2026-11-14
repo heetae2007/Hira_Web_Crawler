@@ -6,7 +6,9 @@ from unittest.mock import Mock, patch
 
 import requests
 
-import biz_hira as biz
+from hira_alert import ssv as ssv_mod
+from hira_alert.sources import biz_legacy as legacy
+
 
 BBS = "BBSMSTR_000000000675"
 
@@ -20,60 +22,60 @@ def row(ident="75913", **changes):
 
 def dataset(rows, name="dsMain", columns=None):
     columns = columns or list(row())
-    return biz.RS.join([f"Dataset:{name}",
-                        biz.US.join(["_RowType_"] + [f"{c}:string(4000)" for c in columns]),
-                        *[biz.US.join(["N"] + [r.get(c, "") for c in columns]) for r in rows], ""])
+    return ssv_mod.RS.join([f"Dataset:{name}",
+                        ssv_mod.US.join(["_RowType_"] + [f"{c}:string(4000)" for c in columns]),
+                        *[ssv_mod.US.join(["N"] + [r.get(c, "") for c in columns]) for r in rows], ""])
 
 
 def ssv(rows):
-    return "SSV:utf-8" + biz.RS + "ErrorCode=0" + biz.RS + dataset(rows)
+    return "SSV:utf-8" + ssv_mod.RS + "ErrorCode=0" + ssv_mod.RS + dataset(rows)
 
 
 class ParserTests(unittest.TestCase):
     def test_twenty_rows_and_multiple_datasets(self):
         rows = [row(str(i)) for i in range(20)]
-        text = "SSV:utf-8" + biz.RS + dataset([{"total": "20"}], "dsCount", ["total"]) + biz.RS
-        text += dataset(rows) + biz.RS + dataset([{"x": "y"}], "dsOther", ["x"])
-        self.assertEqual(biz.parse_ssv_dataset(text, "dsMain"), rows)
+        text = "SSV:utf-8" + ssv_mod.RS + dataset([{"total": "20"}], "dsCount", ["total"]) + ssv_mod.RS
+        text += dataset(rows) + ssv_mod.RS + dataset([{"x": "y"}], "dsOther", ["x"])
+        self.assertEqual(ssv_mod.parse_ssv_dataset(text, "dsMain"), rows)
 
     def test_empty_dataset(self):
-        self.assertEqual(biz.parse_ssv_dataset(ssv([]), "dsMain"), [])
-        self.assertEqual(biz.parse_ssv_dataset("SSV:utf-8" + biz.RS + "Dataset:dsMain" + biz.RS, "dsMain"), [])
+        self.assertEqual(ssv_mod.parse_ssv_dataset(ssv([]), "dsMain"), [])
+        self.assertEqual(ssv_mod.parse_ssv_dataset("SSV:utf-8" + ssv_mod.RS + "Dataset:dsMain" + ssv_mod.RS, "dsMain"), [])
 
     def test_empty_values_pinned_and_korean_html(self):
-        rows = [row("1", isNotice="Y", atchFileId=biz.ETX, nttCn=""),
+        rows = [row("1", isNotice="Y", atchFileId=ssv_mod.ETX, nttCn=""),
                 row("2", nttCn='<p>한글 &amp; 특수문자 "\'\n두 번째 줄</p>')]
-        parsed = biz.parse_ssv_dataset(ssv(rows), "dsMain")
+        parsed = ssv_mod.parse_ssv_dataset(ssv(rows), "dsMain")
         self.assertEqual(parsed[0]["atchFileId"], "")
         self.assertEqual(parsed[0]["nttCn"], "")
         self.assertEqual(parsed[0]["isNotice"], "Y")
         self.assertEqual(parsed[1]["nttCn"], rows[1]["nttCn"])
 
     def test_malformed_and_error_responses_fail_closed(self):
-        for text in ["<html>Login</html>", "SSV:utf-8" + biz.RS + "Dataset:other",
+        for text in ["<html>Login</html>", "SSV:utf-8" + ssv_mod.RS + "Dataset:other",
                      ssv([row()]).replace("ErrorCode=0", "ErrorCode=-1"),
-                     ssv([row()]).replace("N" + biz.US + "75913", "N" + biz.US + "extra" + biz.US + "75913"),
-                     ssv([row()]).replace(biz.US + "N" + biz.RS, biz.RS)]:
-            with self.subTest(text=text[:50]), self.assertRaises(biz.SSVError):
-                biz.parse_ssv_dataset(text, "dsMain")
+                     ssv([row()]).replace("N" + ssv_mod.US + "75913", "N" + ssv_mod.US + "extra" + ssv_mod.US + "75913"),
+                     ssv([row()]).replace(ssv_mod.US + "N" + ssv_mod.RS, ssv_mod.RS)]:
+            with self.subTest(text=text[:50]), self.assertRaises(ssv_mod.SSVError):
+                ssv_mod.parse_ssv_dataset(text, "dsMain")
 
     def test_constant_column_and_deleted_original_rows(self):
-        text = biz.RS.join(["SSV:utf-8", "Dataset:dsMain", "_Const_" + biz.US + "bbsId:STRING=" + BBS,
-                             "_RowType_" + biz.US + "nttId:INT", "N" + biz.US + "1",
-                             "D" + biz.US + "2", "O" + biz.US + "3", ""])
-        self.assertEqual(biz.parse_ssv_dataset(text, "dsMain"), [{"bbsId": BBS, "nttId": "1"}])
+        text = ssv_mod.RS.join(["SSV:utf-8", "Dataset:dsMain", "_Const_" + ssv_mod.US + "bbsId:STRING=" + BBS,
+                             "_RowType_" + ssv_mod.US + "nttId:INT", "N" + ssv_mod.US + "1",
+                             "D" + ssv_mod.US + "2", "O" + ssv_mod.US + "3", ""])
+        self.assertEqual(ssv_mod.parse_ssv_dataset(text, "dsMain"), [{"bbsId": BBS, "nttId": "1"}])
 
     def test_request_body_and_offsets(self):
-        body = biz.build_list_request(BBS, 2)
-        parsed = biz.parse_ssv_dataset(body.decode(), "dsParam")[0]
+        body = legacy.build_list_request(BBS, 2)
+        parsed = ssv_mod.parse_ssv_dataset(body.decode(), "dsParam")[0]
         self.assertEqual(parsed, {"bbsId": BBS, "currentPage": "2", "firstIndex": "20",
                                   "lastIndex": "40", "recordCountPerPage": "20",
                                   "cbSearchCnd": "all", "edSearchWrd": ""})
 
     def test_missing_identity_or_schema_is_error(self):
         for value in [row(""), {"nttId": "1"}, row(bbsId="another")]:
-            with self.assertRaises(biz.SSVError):
-                biz.BizPost.from_row(value, BBS)
+            with self.assertRaises(ssv_mod.SSVError):
+                legacy.BizPost.from_row(value, BBS)
 
 
 class ClassificationTests(unittest.TestCase):
@@ -87,10 +89,10 @@ class ClassificationTests(unittest.TestCase):
             ("고시 제2026-182호", "고시 제2026-182호 / 고시 제2026-183호", ["2026-182", "2026-183"]),
         ]:
             with self.subTest(title=title):
-                self.assertEqual(biz.extract_gosi_numbers(title, content), expected)
+                self.assertEqual(legacy.extract_gosi_numbers(title, content), expected)
 
     def test_prefix(self):
-        post = biz.BizPost.from_row(row(), BBS)
+        post = legacy.BizPost.from_row(row(), BBS)
         self.assertEqual(post.notice_type, "행위")
         self.assertEqual(replace(post, title="[행위 및 치료재료] 안내").notice_type, "행위 및 치료재료")
         self.assertIsNone(replace(post, title="일반 안내").notice_type)
@@ -101,45 +103,45 @@ class PaginationTests(unittest.TestCase):
         pinned = row("pin", isNotice="Y")
         fetch = Mock(side_effect=[[pinned, *[row(str(i)) for i in range(20)]],
                                   [pinned, row("second-page")], [pinned]])
-        posts = list(biz.crawl_biz_hira(BBS, fetch_page=fetch))
+        posts = list(legacy.crawl_biz_hira(BBS, fetch_page=fetch))
         self.assertEqual(len(posts), 22)
         self.assertIn("second-page", [p.ntt_id for p in posts])
         self.assertEqual(fetch.call_count, 3)
 
     def test_repeated_page_and_limit_are_errors(self):
-        with self.assertRaises(biz.SSVError):
-            list(biz.crawl_biz_hira(BBS, fetch_page=Mock(return_value=[row()])))
-        with self.assertRaises(biz.SSVError):
-            list(biz.crawl_biz_hira(BBS, max_pages=1, fetch_page=Mock(return_value=[row()])))
+        with self.assertRaises(ssv_mod.SSVError):
+            list(legacy.crawl_biz_hira(BBS, fetch_page=Mock(return_value=[row()])))
+        with self.assertRaises(ssv_mod.SSVError):
+            list(legacy.crawl_biz_hira(BBS, max_pages=1, fetch_page=Mock(return_value=[row()])))
 
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.addCleanup(self.conn.close)
-        biz.init_biz_db(self.conn)
-        self.post = biz.BizPost.from_row(row(), BBS)
+        legacy.init_biz_db(self.conn)
+        self.post = legacy.BizPost.from_row(row(), BBS)
 
     def run_source(self, posts, sender):
-        with patch.object(biz, "crawl_biz_hira", return_value=iter(posts)):
-            return biz.run_biz(self.conn, [BBS], notify_from_date=date(2026, 9, 9),
+        with patch.object(legacy, "crawl_biz_hira", return_value=iter(posts)):
+            return legacy.run_biz(self.conn, [BBS], notify_from_date=date(2026, 9, 9),
                                publication_date=lambda v: datetime.strptime(v, "%Y%m%d%H%M%S%f").date(),
                                matches_keywords=lambda title, summary: True, send_telegram=sender)
 
     def test_new_unchanged_updated(self):
-        self.assertEqual(biz.store_biz_post(self.conn, self.post), "NEW")
+        self.assertEqual(legacy.store_biz_post(self.conn, self.post), "NEW")
         created = self.conn.execute("SELECT created_at FROM biz_posts").fetchone()[0]
-        self.assertEqual(biz.store_biz_post(self.conn, self.post), "UNCHANGED")
+        self.assertEqual(legacy.store_biz_post(self.conn, self.post), "UNCHANGED")
         for changes in [{"modified_at": "20260916102852000"}, {"title": "바뀐 제목"},
                         {"attachment_id": "new-file"}, {"content": "바뀐 본문"}]:
             with self.subTest(changes=changes):
-                self.assertEqual(biz.store_biz_post(self.conn, replace(self.post, **changes)), "UPDATED")
+                self.assertEqual(legacy.store_biz_post(self.conn, replace(self.post, **changes)), "UPDATED")
         self.assertEqual(self.conn.execute("SELECT created_at FROM biz_posts").fetchone()[0], created)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM biz_posts").fetchone()[0], 1)
 
     def test_board_identity_isolated(self):
-        biz.store_biz_post(self.conn, self.post)
-        self.assertEqual(biz.store_biz_post(self.conn, replace(self.post, bbs_id="other")), "NEW")
+        legacy.store_biz_post(self.conn, self.post)
+        self.assertEqual(legacy.store_biz_post(self.conn, replace(self.post, bbs_id="other")), "NEW")
 
     def test_cutoff_classification_and_update_notifications(self):
         sender = Mock()
@@ -170,19 +172,19 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.run_source([self.post], Mock()), (0, 1, 0))
 
     def test_second_page_update_even_when_first_page_known(self):
-        biz.store_biz_post(self.conn, self.post)
+        legacy.store_biz_post(self.conn, self.post)
         older = replace(self.post, ntt_id="older")
-        biz.store_biz_post(self.conn, older)
+        legacy.store_biz_post(self.conn, older)
         fetch = Mock(side_effect=[[row()], [row("older", atchFileId="changed")], []])
-        with patch.object(biz, "fetch_biz_page", fetch):
-            states = [biz.store_biz_post(self.conn, p) for p in biz.crawl_biz_hira(BBS)]
+        with patch.object(legacy, "fetch_biz_page", fetch):
+            states = [legacy.store_biz_post(self.conn, p) for p in legacy.crawl_biz_hira(BBS)]
         self.assertEqual(states, ["UNCHANGED", "UPDATED"])
 
     def test_keyword_filter_uses_body_and_can_be_re_evaluated(self):
         sender = Mock()
         matcher = Mock(return_value=False)
-        with patch.object(biz, "crawl_biz_hira", return_value=iter([self.post])):
-            result = biz.run_biz(self.conn, [BBS], notify_from_date=date(2026, 9, 9),
+        with patch.object(legacy, "crawl_biz_hira", return_value=iter([self.post])):
+            result = legacy.run_biz(self.conn, [BBS], notify_from_date=date(2026, 9, 9),
                                  publication_date=lambda v: date(2026, 9, 15),
                                  matches_keywords=matcher, send_telegram=sender)
         self.assertEqual(result, (1, 0, 0))
@@ -198,8 +200,8 @@ class HttpTests(unittest.TestCase):
         return response
 
     def test_cookie_free_ssv_request(self):
-        with patch.object(biz.requests, "post", return_value=self.response()) as post:
-            self.assertEqual(len(biz.fetch_biz_page(BBS, 1)), 1)
+        with patch.object(legacy.requests, "post", return_value=self.response()) as post:
+            self.assertEqual(len(legacy.fetch_biz_page(BBS, 1)), 1)
         args = post.call_args.kwargs
         self.assertIsInstance(args["data"], bytes)
         self.assertNotIn("cookies", args)
@@ -208,14 +210,14 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(args["allow_redirects"])
 
     def test_retry_timeout_and_503(self):
-        with patch.object(biz.requests, "post", side_effect=[requests.Timeout(), self.response(503), self.response()]) as post, \
-             patch.object(biz.time, "sleep"):
-            self.assertEqual(len(biz.fetch_biz_page(BBS, 1)), 1)
+        with patch.object(legacy.requests, "post", side_effect=[requests.Timeout(), self.response(503), self.response()]) as post, \
+             patch.object(legacy.time, "sleep"):
+            self.assertEqual(len(legacy.fetch_biz_page(BBS, 1)), 1)
             self.assertEqual(post.call_count, 3)
 
     def test_redirect_rejected(self):
-        with patch.object(biz.requests, "post", return_value=self.response(302)), self.assertRaises(biz.SSVError):
-            biz.fetch_biz_page(BBS, 1)
+        with patch.object(legacy.requests, "post", return_value=self.response(302)), self.assertRaises(ssv_mod.SSVError):
+            legacy.fetch_biz_page(BBS, 1)
 
 
 if __name__ == "__main__":

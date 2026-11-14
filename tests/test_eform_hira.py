@@ -4,28 +4,28 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
-import biz_hira as biz
-import eform_hira as ef
+from hira_alert import ssv
+from hira_alert.sources import biz_legacy as legacy, biz_main, eform as ef, notice_board
 
 
 def payload(page=1, total=21):
     columns = ['rn', 'totCnt', 'brdId', 'brdTtl', 'creDt']
     rows = [[str(i), str(total), str(3000 + i), '공지 ' + str(i), '2026-09-22 09:00']
             for i in range((page - 1) * 20 + 1, min(page * 20, total) + 1)]
-    return biz.RS.join(['SSV:utf-8', 'ErrorCode:int=0', 'Dataset:dsList',
-                         biz.US.join(['_RowType_'] + [c + ':STRING(256)' for c in columns]),
-                         *[biz.US.join(['N', *row]) for row in rows], '', ''])
+    return ssv.RS.join(['SSV:utf-8', 'ErrorCode:int=0', 'Dataset:dsList',
+                         ssv.US.join(['_RowType_'] + [c + ':STRING(256)' for c in columns]),
+                         *[ssv.US.join(['N', *row]) for row in rows], '', ''])
 
 
 class EformParsingTests(unittest.TestCase):
     def test_request_matches_captured_field_order_and_nulls(self):
         body = ef.build_request(2)
-        records = body.decode().split(biz.RS)
+        records = body.decode().split(ssv.RS)
         self.assertEqual(records[0:2], ['SSV:utf-8', 'Dataset:dsCond'])
-        self.assertEqual(records[2].split(biz.US)[1:], [c + ':STRING(256)' for c in ef.COLUMNS])
-        self.assertEqual(records[3].split(biz.US),
-                         ['N', biz.ETX, biz.ETX, '', '0', biz.ETX, '20', '2', biz.ETX,
-                          '', 'W', biz.ETX, ''])
+        self.assertEqual(records[2].split(ssv.US)[1:], [c + ':STRING(256)' for c in ef.COLUMNS])
+        self.assertEqual(records[3].split(ssv.US),
+                         ['N', ssv.ETX, ssv.ETX, '', '0', ssv.ETX, '20', '2', ssv.ETX,
+                          '', 'W', ssv.ETX, ''])
         self.assertNotIn(b'WMONID', body)
         with self.assertRaises(ValueError):
             ef.build_request(0)
@@ -45,10 +45,10 @@ class EformParsingTests(unittest.TestCase):
                              (payload().replace('ErrorCode:int=0', 'ErrorCode:int=-1'), 1),
                              (payload().replace('creDt:', 'wrong:'), 1),
                              (payload().replace('2026-09-22 09:00', 'invalid'), 1),
-                             (payload().replace(biz.US + '21' + biz.US,
-                                                biz.US + '99' + biz.US, 1), 1),
+                             (payload().replace(ssv.US + '21' + ssv.US,
+                                                ssv.US + '99' + ssv.US, 1), 1),
                              (payload(total=0), 1)]:
-            with self.subTest(number=number), self.assertRaises(biz.SSVError):
+            with self.subTest(number=number), self.assertRaises(ssv.SSVError):
                 ef.parse_page(text, number)
 
 
@@ -84,7 +84,7 @@ class FetchTests(unittest.TestCase):
         for responses in [(self.response('', 302),), (self.response('', 503),),
                           (self.response(payload()), self.response(payload()))]:
             context = self.context(*responses)
-            with self.assertRaises(biz.SSVError):
+            with self.assertRaises(ssv.SSVError):
                 ef.fetch_with_context(context, pages=2, sleep=Mock())
             self.assertEqual(context.request.post.call_count, len(responses))
 
@@ -100,10 +100,10 @@ class StorageTests(unittest.TestCase):
     def test_source_isolation_retry_cooldown_and_preserve_snapshot(self):
         conn = sqlite3.connect(':memory:')
         self.addCleanup(conn.close)
-        notice = biz.MainNotice('W', '1', 'e-form 공지', '2026-09-22')
+        notice = notice_board.MainNotice('W', '1', 'e-form 공지', '2026-09-22')
         sender = Mock()
         # Identical keys across sources must never suppress e-form notification.
-        biz.run_main_notices(conn, send_notification=sender, fetch=lambda: [notice], now=1000)
+        biz_main.run_main_notices(conn, send_notification=sender, fetch=lambda: [notice], now=1000)
         sender.reset_mock()
         sender.side_effect = RuntimeError('send failed')
         self.assertEqual(ef.run_eform(conn, send_notification=sender, fetch=lambda: [notice], now=1000),

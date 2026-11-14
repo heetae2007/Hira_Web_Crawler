@@ -12,3 +12,5 @@ __pycache__/
 
 # 비밀값
 .env
+.hira-alert.lock
+cron.log
